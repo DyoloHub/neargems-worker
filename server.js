@@ -204,12 +204,19 @@ async function deepScanToken(tokenId, isPriority = false) {
         processed.add(whaleId);
 
         // Fetch History (Pages 1 & 2)
+        // THIS IS THE SPIDER LOGIC: Fetching transaction history for each holder
         const pages = [1, 2]; 
         const promises = pages.map(p => fetchWithRetry(`${API_TXNS}/${whaleId}/ft-txns?page=${p}&per_page=50`));
-        const results = await Promise.all(promises);
+        
+        // Also fetch native transactions to find direct connections
+        const nativePromise = fetchWithRetry(`${API_TXNS}/${whaleId}/txns?page=1&per_page=25`);
+        
+        const results = await Promise.all([...promises, nativePromise]);
 
-        results.forEach(data => {
-            if (!data || !data.txns) return;
+        // Process FT Transactions
+        for (let i = 0; i < pages.length; i++) {
+            const data = results[i];
+            if (!data || !data.txns) continue;
             data.txns.forEach(tx => {
                 let partner = tx.involved_account_id;
                 if (!partner) partner = (tx.receiver_account_id === whaleId) ? tx.signer_account_id : tx.receiver_account_id;
@@ -226,7 +233,28 @@ async function deepScanToken(tokenId, isPriority = false) {
                     processed.add(partner);
                 }
             });
-        });
+        }
+        
+        // Process Native Transactions
+        const nativeData = results[results.length - 1]; // Last result is native
+        if (nativeData && nativeData.txns) {
+             nativeData.txns.forEach(tx => {
+                let partner = (tx.receiver_account_id === whaleId) ? tx.signer_account_id : tx.receiver_account_id;
+                
+                if (!partner || partner === whaleId) return;
+
+                const linkId = [whaleId, partner].sort().join("-");
+                if (!links.find(l => l.id === linkId)) {
+                    links.push({ source: whaleId, target: partner, id: linkId });
+                }
+                
+                if (!processed.has(partner)) {
+                    nodes.push({ id: partner, group: "partner", balance: "0", isCore: false });
+                    processed.add(partner);
+                }
+            });
+        }
+
         await wait(200); 
     }
 

@@ -1,0 +1,153 @@
+const fs = require('fs');
+const path = require('path');
+
+// --- CONFIGURATION ---
+const TOKENS_TO_SCAN = [
+    "jambo-1679.meme-cooking.near",
+    "blackdragon.tkn.near",
+    "lonk.tkn.near"
+    // Add more tokens here
+];
+
+const API_TXNS = "https://api.nearblocks.io/v1/account";
+const SCAN_INTERVAL = 60 * 1000; // 1 minute between scans to be safe
+const DB_FILE = path.join(__dirname, 'db_graph_data.json');
+
+// --- STATE ---
+let db = {};
+
+// Load existing DB
+if (fs.existsSync(DB_FILE)) {
+    try {
+        db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+        console.log(`[INIT] Loaded database with ${Object.keys(db).length} tokens.`);
+    } catch (e) {
+        console.error("[INIT] DB corrupt, starting fresh.");
+        db = {};
+    }
+}
+
+// --- UTILS ---
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function fetchWithRetry(url, retries = 5) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            // Native fetch is available in Node 18+
+            const res = await fetch(url);
+            
+            if (res.status === 429) {
+                const delay = 2000 * Math.pow(2, i);
+                console.log(`[429] Rate Limit. Waiting ${delay}ms...`);
+                await wait(delay);
+                continue;
+            }
+            
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return await res.json();
+        } catch (e) {
+            console.error(`[ERR] Attempt ${i+1}: ${e.message}`);
+            await wait(1000);
+        }
+    }
+    return null;
+}
+
+// --- SCANNING LOGIC (Simplified "God Mode") ---
+async function scanToken(token) {
+    console.log(`[SCAN] Starting scan for: ${token}`);
+    
+    // 1. Get Top Holders
+    // Note: In a real worker, you'd use the FastNear or NearBlocks API for this list
+    // For this demo, we'll assume we fetch a small list or use a hardcoded seed
+    // Let's assume we fetch top 50 holders
+    const holdersUrl = `https://api.fastnear.com/v1/ft/${token}/top`; 
+    const holdersData = await fetchWithRetry(holdersUrl);
+    
+    if (!holdersData || !holdersData.accounts) {
+        console.log(`[SKIP] No holders found for ${token}`);
+        return;
+    }
+
+    const holders = holdersData.accounts.slice(0, 50); // Scan top 50
+    let nodes = [];
+    let links = [];
+    let processed = new Set();
+
+    // 2. Deep Scan each holder
+    for (const h of holders) {
+        const whaleId = h.account_id;
+        if (processed.has(whaleId)) continue;
+        
+        // Add Node
+        nodes.push({ id: whaleId, balance: h.balance, isCore: true });
+        processed.add(whaleId);
+
+        console.log(`   -> Deep Scanning Whale: ${whaleId}`);
+
+        // Fetch Pages 1-3 concurrently (The "God Mode" logic)
+        const pages = [1, 2, 3];
+        const promises = pages.map(p => fetchWithRetry(`${API_TXNS}/${whaleId}/ft-txns?page=${p}&per_page=50`));
+        
+        const results = await Promise.all(promises);
+        
+        // Process Transactions
+        results.forEach(data => {
+            if (!data || !data.txns) return;
+            
+            data.txns.forEach(tx => {
+                let partner = null;
+                // Determine partner
+                if (tx.involved_account_id) partner = tx.involved_account_id;
+                else if (tx.receiver_account_id === whaleId) partner = tx.signer_account_id;
+                else partner = tx.receiver_account_id;
+
+                if (!partner || partner === whaleId) return;
+
+                // Add Link
+                const linkId = [whaleId, partner].sort().join("-");
+                // Avoid dupes in local list
+                if (!links.find(l => l.id === linkId)) {
+                    links.push({ source: whaleId, target: partner, id: linkId });
+                }
+
+                // Add Partner Node if new
+                if (!processed.has(partner)) {
+                    nodes.push({ id: partner, group: "partner" });
+                    processed.add(partner);
+                }
+            });
+        });
+
+        // Be gentle
+        await wait(500); 
+    }
+
+    // 3. Save to DB
+    db[token] = {
+        nodes: nodes,
+        links: links,
+        lastUpdated: Date.now()
+    };
+
+    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+    console.log(`[SAVE] Saved ${nodes.length} nodes and ${links.length} links for ${token}`);
+}
+
+// --- WORKER LOOP ---
+async function startWorker() {
+    console.log("--- WORKER STARTED ---");
+    let index = 0;
+
+    while (true) {
+        const token = TOKENS_TO_SCAN[index];
+        await scanToken(token);
+        
+        index = (index + 1) % TOKENS_TO_SCAN.length;
+        
+        console.log(`[SLEEP] Resting for ${SCAN_INTERVAL/1000}s...`);
+        await wait(SCAN_INTERVAL);
+    }
+}
+
+startWorker();

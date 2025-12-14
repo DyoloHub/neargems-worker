@@ -8,6 +8,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
+app.use(express.json()); // Enable JSON body parsing for POST requests
 
 // --- CONFIGURATION ---
 const API_TXNS = "https://api.nearblocks.io/v1/account";
@@ -25,6 +26,7 @@ const DB_FILE = path.join(__dirname, 'db_graph_data.json');
 let db = {};
 let ecoList = []; // Full list of ALL tokens found on Ref, sorted by TVL
 let ecoIndex = 0; // Pointer for deep scanning loop
+let priorityQueue = []; // List of tokens requested by users
 
 // Load DB on start
 if (fs.existsSync(DB_FILE)) {
@@ -38,11 +40,12 @@ if (fs.existsSync(DB_FILE)) {
 app.get('/', (req, res) => {
     res.send(`
         <div style="font-family: monospace; padding: 20px; background:#111; color:#00EC97;">
-            <h1>🧠 NearGems Brain (Upgraded)</h1>
+            <h1>🧠 NearGems Brain (Upgraded + Priority)</h1>
             <p><strong>Status:</strong> Active</p>
             <p><strong>Ecosystem Size:</strong> ${ecoList.length} tokens detected</p>
             <p><strong>Deep Scanned:</strong> ${Object.keys(db).length} tokens</p>
-            <p><strong>Current Target:</strong> ${ecoList[ecoIndex]?.symbol || 'Initializing...'} (Rank #${ecoIndex+1})</p>
+            <p><strong>Priority Queue:</strong> ${priorityQueue.length} pending</p>
+            <p><strong>Current Target:</strong> ${priorityQueue.length > 0 ? 'PRIORITY: ' + priorityQueue[0] : (ecoList[ecoIndex]?.symbol || 'Initializing...')}</p>
         </div>
     `);
 });
@@ -50,6 +53,16 @@ app.get('/', (req, res) => {
 // 1. Get Graph Data for a specific token
 app.get('/data', (req, res) => {
     const token = req.query.token;
+    
+    // --- SIGNAL: User is searching for this token! ---
+    if (token && !priorityQueue.includes(token)) {
+        // Add to front of line if not already queued
+        console.log(`[SIGNAL] Priority request received for: ${token}`);
+        priorityQueue.unshift(token); 
+        // Cap queue size to prevent spam attacks
+        if (priorityQueue.length > 20) priorityQueue.pop();
+    }
+
     if (token && db[token]) {
         return res.json(db[token]);
     }
@@ -58,16 +71,15 @@ app.get('/data', (req, res) => {
     if (known) {
         return res.json({ 
             status: "partial",
-            market: known, // Return price/tvl data even if graph is missing
-            message: "Graph scan pending. Using cached market data." 
+            market: known, 
+            message: "Graph scan pending. Added to priority queue." 
         });
     }
-    res.json({ status: "miss", message: "Token unknown." });
+    res.json({ status: "miss", message: "Token unknown. Queued for discovery." });
 });
 
 // 2. Get FULL Ecosystem List (for Eco Mode bubbles)
 app.get('/eco', (req, res) => {
-    // Return simplified list to save bandwidth
     const simpleList = ecoList.map(t => ({
         id: t.id,
         symbol: t.symbol,
@@ -111,12 +123,10 @@ async function fetchWithRetry(url, retries = 3) {
 async function updateEcosystemMap() {
     console.log("[BRAIN] Mapping entire NEAR ecosystem...");
     try {
-        // A. Get Liquidity Pools (Source of Truth for TVL)
         const poolsRes = await fetch(API_REF_POOLS);
         const pools = await poolsRes.json();
         
         const tvlMap = {};
-        const priceMap = {}; // Rough price estimation from pools if needed
 
         pools.forEach(p => {
             const tvl = parseFloat(p.tvl);
@@ -127,19 +137,14 @@ async function updateEcosystemMap() {
             }
         });
 
-        // B. Convert to List & Sort
         let newEcoList = Object.keys(tvlMap).map(id => ({
             id: id,
             tvl: tvlMap[id],
-            symbol: id.split('.')[0].toUpperCase().slice(0, 6) // Temp symbol
+            symbol: id.split('.')[0].toUpperCase().slice(0, 6)
         }));
 
-        // Filter dust
-        newEcoList = newEcoList.filter(t => t.tvl > 1000); // Only care about >$1k TVL
-        newEcoList.sort((a, b) => b.tvl - a.tvl); // Sort High to Low
-
-        // C. Enrich with Gecko Data (Batch or individual? We'll do individual during scan, but basic batch here if possible)
-        // For now, we rely on the Deep Scan loop to fill in precise MC/Price.
+        newEcoList = newEcoList.filter(t => t.tvl > 1000); 
+        newEcoList.sort((a, b) => b.tvl - a.tvl); 
         
         ecoList = newEcoList;
         console.log(`[BRAIN] Map Updated. Tracking ${ecoList.length} tokens.`);
@@ -150,12 +155,14 @@ async function updateEcosystemMap() {
 }
 
 // STEP 2: Deep Scan a Single Token (Graph + Market Data)
-async function deepScanToken(tokenObj) {
-    const tokenId = tokenObj.id;
-    console.log(`[SCAN] Processing #${ecoIndex+1}: ${tokenId} (TVL: $${Math.floor(tokenObj.tvl)})`);
+async function deepScanToken(tokenId, isPriority = false) {
+    console.log(`[SCAN] Processing ${isPriority ? '🔥 PRIORITY' : ''}: ${tokenId}`);
     
+    // Find basic info if in ecoList, or create stub
+    let tokenObj = ecoList.find(t => t.id === tokenId) || { id: tokenId, tvl: 0 };
+
     // A. Fetch Market Data (Gecko)
-    let marketData = { tvl: tokenObj.tvl }; // Start with Ref TVL
+    let marketData = { tvl: tokenObj.tvl }; 
     try {
         const geckoData = await fetchWithRetry(`${API_GECKO}/${tokenId}`);
         if (geckoData && geckoData.data) {
@@ -164,7 +171,7 @@ async function deepScanToken(tokenObj) {
             marketData.mcap = parseFloat(attr.market_cap_usd || attr.fdv_usd || 0);
             marketData.vol24 = parseFloat(attr.volume_usd?.h24 || 0);
             
-            // Update the master list cache too
+            // Update cache
             tokenObj.price = marketData.price;
             tokenObj.mcap = marketData.mcap;
         }
@@ -231,7 +238,7 @@ async function deepScanToken(tokenObj) {
         lastUpdated: Date.now()
     };
     
-    // Persist (Best effort for free tier)
+    // Persist
     try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e) {}
     
     console.log(`[SAVE] ${tokenId}: ${nodes.length} nodes, ${links.length} links saved.`);
@@ -241,27 +248,30 @@ async function deepScanToken(tokenObj) {
 async function startBrain() {
     await updateEcosystemMap(); // Initial Map Build
 
-    // Refresh Map Loop (Independent)
     setInterval(updateEcosystemMap, REFRESH_LIST_INTERVAL);
 
     // Deep Scan Loop
     while (true) {
-        if (ecoList.length === 0) {
-            await wait(5000); 
+        let targetId = null;
+        let isPriority = false;
+
+        // 1. Check Priority Queue First
+        if (priorityQueue.length > 0) {
+            targetId = priorityQueue.shift(); // Take first item
+            isPriority = true;
+        } 
+        // 2. Fallback to Eco List (High TVL)
+        else if (ecoList.length > 0) {
+            targetId = ecoList[ecoIndex]?.id;
+            ecoIndex = (ecoIndex + 1) % ecoList.length;
+            if (ecoIndex === 0) console.log("[LOOP] Restarting ecosystem cycle.");
+        }
+
+        if (targetId) {
+            await deepScanToken(targetId, isPriority);
+        } else {
+            await wait(5000); // Empty list? Wait.
             continue;
-        }
-
-        // Get current target
-        const target = ecoList[ecoIndex];
-        if (target) {
-            await deepScanToken(target);
-        }
-
-        // Move to next (Round Robin)
-        ecoIndex++;
-        if (ecoIndex >= ecoList.length) {
-            ecoIndex = 0; // Restart from top TVL
-            console.log("[LOOP] Completed full ecosystem cycle. Restarting from top.");
         }
 
         console.log(`[SLEEP] Resting...`);

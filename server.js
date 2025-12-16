@@ -49,7 +49,8 @@ let db = {};
 let ecoList = []; 
 let ecoIndex = 0; 
 let priorityQueue = []; 
-const activeSessions = new Map(); // NEW: Track active users (IP/Session -> Timestamp)
+const activeSessions = new Map(); // Track active users (IP/Session -> Timestamp)
+const scanCounts = new Map(); // NEW: Track scan counts per token ID
 
 // --- DATABASE SETUP (MONGODB) ---
 let TokenModel = null;
@@ -155,6 +156,9 @@ app.post('/api/admin/flush-all', requireAdmin, async (req, res) => {
         }
         try { fs.writeFileSync(DB_FILE, JSON.stringify({})); } catch(e){}
         
+        // Also clear stats
+        scanCounts.clear();
+        
         console.log(`[ADMIN] FLUSHED ALL DATA`);
         res.json({ success: true, message: "All graph data deleted." });
     } catch (e) {
@@ -162,7 +166,7 @@ app.post('/api/admin/flush-all', requireAdmin, async (req, res) => {
     }
 });
 
-// 4. Get Server Stats (Updated with Real Online Users)
+// 4. Get Server Stats (Updated with Top Scanned)
 app.get('/api/admin/stats', requireAdmin, async (req, res) => {
     const memKeys = Object.keys(db).length;
     let dbCount = 0;
@@ -173,13 +177,20 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
     for (const [id, lastSeen] of activeSessions.entries()) {
         if (now - lastSeen > 60000) activeSessions.delete(id);
     }
+    
+    // Calculate Top Scanned
+    const topScanned = [...scanCounts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([id, count]) => ({ id, count }));
 
     res.json({
         memory_keys: memKeys,
         mongo_docs: dbCount,
         queue_length: priorityQueue.length,
         eco_list_size: ecoList.length,
-        online_users: activeSessions.size // Real real-time count
+        online_users: activeSessions.size,
+        top_scanned: topScanned // Return top scanned list
     });
 });
 
@@ -216,10 +227,18 @@ app.get('/api/top-donors', async (req, res) => {
 
 app.get('/data', async (req, res) => {
     const token = req.query.token;
-    if (token && !priorityQueue.includes(token)) {
-        priorityQueue.unshift(token); 
-        if (priorityQueue.length > 20) priorityQueue.pop();
+    
+    // Update Scan Count
+    if (token) {
+        const current = scanCounts.get(token) || 0;
+        scanCounts.set(token, current + 1);
+        
+        if (!priorityQueue.includes(token)) {
+            priorityQueue.unshift(token); 
+            if (priorityQueue.length > 20) priorityQueue.pop();
+        }
     }
+    
     if (!token) return res.json({ status: "miss" });
     
     // Check Memory First

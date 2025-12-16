@@ -9,6 +9,8 @@ try { mongoose = require('mongoose'); } catch (e) { console.log("[WARN] Mongoose
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI; 
+// SECURE ADMIN PASSWORD (Set this in Render Environment Variables)
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "change_this_default_password";
 
 // --- SECURITY: THE BOUNCER (CORS) ---
 const allowedOrigins = [
@@ -20,9 +22,11 @@ const allowedOrigins = [
 
 app.use(cors({
     origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps or curl requests)
         if (!origin) return callback(null, true);
         if (allowedOrigins.indexOf(origin) === -1) {
-            return callback(null, true); // Permissive for now to avoid blocks, tighten later if needed
+            // OPTIONAL: Allow admin page access from anywhere or add specific domain
+            return callback(null, true); 
         }
         return callback(null, true);
     }
@@ -48,7 +52,7 @@ let priorityQueue = [];
 
 // --- DATABASE SETUP (MONGODB) ---
 let TokenModel = null;
-let DonationModel = null; // NEW: Donation Model
+let DonationModel = null;
 
 if (mongoose && MONGO_URI) {
     console.log("[DB] Connecting to MongoDB...");
@@ -66,7 +70,7 @@ if (mongoose && MONGO_URI) {
     });
     TokenModel = mongoose.model('TokenGraph', TokenSchema);
 
-    // 2. NEW: Donation Schema
+    // 2. Donation Schema
     const DonationSchema = new mongoose.Schema({
         sender: String,
         amount: Number,
@@ -77,11 +81,20 @@ if (mongoose && MONGO_URI) {
     DonationModel = mongoose.model('Donation', DonationSchema);
 
 } else {
-    // ... file fallback logic ...
+    // File fallback
     if (fs.existsSync(DB_FILE)) {
         try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { db = {}; }
     }
 }
+
+// --- ADMIN MIDDLEWARE ---
+const requireAdmin = (req, res, next) => {
+    const pass = req.headers['x-admin-password'];
+    if (!pass || pass !== ADMIN_PASSWORD) {
+        return res.status(403).json({ error: "Access Denied: Invalid Password" });
+    }
+    next();
+};
 
 // --- WEB ENDPOINTS ---
 
@@ -89,67 +102,98 @@ app.get('/', (req, res) => {
     res.send('NearGems Brain is Active.');
 });
 
-// --- NEW ENDPOINT: SAVE DONATION ---
-app.post('/api/record-donation', async (req, res) => {
-    if (!DonationModel) return res.status(503).json({ error: "DB not connected" });
-    
-    const { sender, amount, txHash, message } = req.body;
-    
-    if (!sender || !amount || !txHash) {
-        return res.status(400).json({ error: "Missing fields" });
-    }
+// --- ADMIN ENDPOINTS (NEW) ---
 
-    try {
-        const newDonation = new DonationModel({
-            sender,
-            amount,
-            txHash,
-            message: message || "",
-            timestamp: Date.now()
-        });
-        await newDonation.save();
-        console.log(`[DONATION] Saved: ${amount} NEAR from ${sender}`);
-        res.json({ success: true });
-    } catch (e) {
-        console.error("Donation Save Error:", e);
-        // Duplicate key error means we already recorded it, which is fine
-        if(e.code === 11000) return res.json({ success: true, message: "Already recorded" });
-        res.status(500).json({ error: "Internal Error" });
-    }
+// 1. Check Login
+app.post('/api/admin/login', requireAdmin, (req, res) => {
+    res.json({ success: true, message: "Logged in successfully" });
 });
 
-// --- NEW ENDPOINT: GET TOP DONORS (FROM DB) ---
-app.get('/api/top-donors', async (req, res) => {
-    if (!DonationModel) return res.json([]);
-    
-    try {
-        // Aggregate total amount per sender
-        const leaderboard = await DonationModel.aggregate([
-            {
-                $group: {
-                    _id: "$sender",
-                    totalAmount: { $sum: "$amount" },
-                    count: { $sum: 1 },
-                    lastDonation: { $max: "$timestamp" }
-                }
-            },
-            { $sort: { totalAmount: -1 } },
-            { $limit: 20 }
-        ]);
-        
-        // Also get single biggest drops
-        const biggestDrops = await DonationModel.find().sort({ amount: -1 }).limit(10);
+// 2. Reset Specific Token Data
+app.post('/api/admin/reset-token', requireAdmin, async (req, res) => {
+    const { tokenId } = req.body;
+    if (!tokenId) return res.status(400).json({ error: "Token ID required" });
 
-        res.json({
-            total_leaderboard: leaderboard,
-            single_drops: biggestDrops
-        });
+    try {
+        // Clear from Memory
+        if (db[tokenId]) delete db[tokenId];
+        
+        // Clear from MongoDB
+        if (TokenModel) {
+            await TokenModel.deleteOne({ id: tokenId });
+        }
+        
+        // Sync File
+        try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e){}
+
+        console.log(`[ADMIN] Wiped data for ${tokenId}`);
+        res.json({ success: true, message: `Database entry for ${tokenId} deleted.` });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
 
-// ... [Existing /data and /eco endpoints remain unchanged] ...
+// 3. Flush All Cache (Dangerous)
+app.post('/api/admin/flush-all', requireAdmin, async (req, res) => {
+    try {
+        db = {};
+        if (TokenModel) {
+            await TokenModel.deleteMany({});
+        }
+        try { fs.writeFileSync(DB_FILE, JSON.stringify({})); } catch(e){}
+        
+        console.log(`[ADMIN] FLUSHED ALL DATA`);
+        res.json({ success: true, message: "All graph data deleted." });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 4. Get Server Stats
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+    const memKeys = Object.keys(db).length;
+    let dbCount = 0;
+    if (TokenModel) dbCount = await TokenModel.countDocuments();
+    
+    res.json({
+        memory_keys: memKeys,
+        mongo_docs: dbCount,
+        queue_length: priorityQueue.length,
+        eco_list_size: ecoList.length
+    });
+});
+
+// --- PUBLIC ENDPOINTS ---
+
+app.post('/api/record-donation', async (req, res) => {
+    if (!DonationModel) return res.status(503).json({ error: "DB not connected" });
+    const { sender, amount, txHash, message } = req.body;
+    if (!sender || !amount || !txHash) return res.status(400).json({ error: "Missing fields" });
+
+    try {
+        const newDonation = new DonationModel({ sender, amount, txHash, message: message || "", timestamp: Date.now() });
+        await newDonation.save();
+        console.log(`[DONATION] Saved: ${amount} NEAR from ${sender}`);
+        res.json({ success: true });
+    } catch (e) {
+        if(e.code === 11000) return res.json({ success: true, message: "Already recorded" });
+        res.status(500).json({ error: "Internal Error" });
+    }
+});
+
+app.get('/api/top-donors', async (req, res) => {
+    if (!DonationModel) return res.json([]);
+    try {
+        const leaderboard = await DonationModel.aggregate([
+            { $group: { _id: "$sender", totalAmount: { $sum: "$amount" }, count: { $sum: 1 }, lastDonation: { $max: "$timestamp" } } },
+            { $sort: { totalAmount: -1 } },
+            { $limit: 20 }
+        ]);
+        const biggestDrops = await DonationModel.find().sort({ amount: -1 }).limit(10);
+        res.json({ total_leaderboard: leaderboard, single_drops: biggestDrops });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/data', async (req, res) => {
     const token = req.query.token;
     if (token && !priorityQueue.includes(token)) {
@@ -157,11 +201,18 @@ app.get('/data', async (req, res) => {
         if (priorityQueue.length > 20) priorityQueue.pop();
     }
     if (!token) return res.json({ status: "miss" });
+    
+    // Check Memory First
     if (db[token]) return res.json(db[token]);
+    
+    // Check Mongo
     if (TokenModel) {
         try {
             const doc = await TokenModel.findOne({ id: token });
-            if (doc) { db[token] = doc.toObject(); return res.json(doc); }
+            if (doc) { 
+                db[token] = doc.toObject(); // Cache it back to memory
+                return res.json(doc); 
+            }
         } catch(e) {}
     }
     const known = ecoList.find(t => t.id === token);
@@ -185,9 +236,7 @@ app.listen(PORT, () => {
     startBrain(); 
 });
 
-// ... [Existing Worker Logic remains unchanged] ...
-// (Include fetchWithRetry, updateEcosystemMap, deepScanToken, startBrain functions here exactly as before)
-// For brevity in this diff, I am assuming the previous worker logic is kept below.
+// --- WORKER LOGIC ---
 
 const wait = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -231,7 +280,7 @@ async function updateEcosystemMap() {
     } catch (e) {}
 }
 
-async function deepScanToken(tokenId, isPriority = false) {
+async function deepScanToken(tokenId) {
     let tokenObj = ecoList.find(t => t.id === tokenId) || { id: tokenId, tvl: 0 };
     let marketData = { tvl: tokenObj.tvl }; 
     try {
@@ -240,8 +289,6 @@ async function deepScanToken(tokenId, isPriority = false) {
             const attr = geckoData.data.attributes;
             marketData.price = parseFloat(attr.price_usd || 0);
             marketData.mcap = parseFloat(attr.market_cap_usd || attr.fdv_usd || 0);
-            tokenObj.price = marketData.price;
-            tokenObj.mcap = marketData.mcap;
         }
     } catch(e) {}
 
@@ -264,30 +311,20 @@ async function deepScanToken(tokenId, isPriority = false) {
         const nativePromise = fetchWithRetry(`${API_TXNS}/${whaleId}/txns?page=1&per_page=25`);
         const results = await Promise.all([...promises, nativePromise]);
 
-        for (let i = 0; i < pages.length; i++) {
+        for (let i = 0; i < results.length; i++) {
             const data = results[i];
             if (!data || !data.txns) continue;
             data.txns.forEach(tx => {
                 let partner = tx.involved_account_id;
                 if (!partner) partner = (tx.receiver_account_id === whaleId) ? tx.signer_account_id : tx.receiver_account_id;
                 if (!partner || partner === whaleId) return;
+                
                 const linkId = [whaleId, partner].sort().join("-");
                 if (!links.find(l => l.id === linkId)) links.push({ source: whaleId, target: partner, id: linkId });
+                
                 if (!processed.has(partner)) {
-                    nodes.push({ id: partner, group: "partner", balance: "0", isCore: false });
-                    processed.add(partner);
-                }
-            });
-        }
-        
-        const nativeData = results[results.length-1];
-        if(nativeData && nativeData.txns) {
-             nativeData.txns.forEach(tx => {
-                let partner = (tx.receiver_account_id === whaleId) ? tx.signer_account_id : tx.receiver_account_id;
-                if (!partner || partner === whaleId) return;
-                const linkId = [whaleId, partner].sort().join("-");
-                if (!links.find(l => l.id === linkId)) links.push({ source: whaleId, target: partner, id: linkId });
-                if (!processed.has(partner)) {
+                    // NOTE: Balance defaults to 0 here to avoid making 1000s of RPC calls.
+                    // The client-side (main.js) should fetch these specific balances if clicked/needed.
                     nodes.push({ id: partner, group: "partner", balance: "0", isCore: false });
                     processed.add(partner);
                 }

@@ -256,8 +256,8 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
         queue_length: priorityQueue.length,
         eco_list_size: ecoList.length,
         online_users: activeSessions.size,
-        top_scanned: allTime.slice(0, 500), // Return up to 500 for scrolling
-        top_scanned_24h: last24h.slice(0, 500),
+        top_scanned: allTime.slice(0, 10),
+        top_scanned_24h: last24h.slice(0, 10),
         recent_activity: recentActivity,
         mode_usage: modeStats
     });
@@ -295,20 +295,18 @@ app.get('/api/top-donors', async (req, res) => {
 
 app.get('/data', async (req, res) => {
     const token = req.query.token;
-    const isUserSearch = req.query.source === 'user'; // ONLY count if source=user
     
     // Update Scan Count (Store Timestamp)
-    if (token && isUserSearch) {
+    if (token) {
         const currentTimestamps = scanCounts.get(token) || [];
         currentTimestamps.push(Date.now());
         scanCounts.set(token, currentTimestamps);
         saveDatabase(); // Save counts on change
-    }
-    
-    // Priority Queue logic can still run for any fetch to ensure cache is warm
-    if (token && !priorityQueue.includes(token)) {
-        priorityQueue.unshift(token); 
-        if (priorityQueue.length > 20) priorityQueue.pop();
+        
+        if (!priorityQueue.includes(token)) {
+            priorityQueue.unshift(token); 
+            if (priorityQueue.length > 20) priorityQueue.pop();
+        }
     }
     
     if (!token) return res.json({ status: "miss" });

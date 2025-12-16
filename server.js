@@ -49,6 +49,7 @@ let db = {};
 let ecoList = []; 
 let ecoIndex = 0; 
 let priorityQueue = []; 
+const activeSessions = new Map(); // NEW: Track active users (IP/Session -> Timestamp)
 
 // --- DATABASE SETUP (MONGODB) ---
 let TokenModel = null;
@@ -102,6 +103,18 @@ app.get('/', (req, res) => {
     res.send('NearGems Brain is Active.');
 });
 
+// NEW: Heartbeat Endpoint for Real-Time Analytics
+app.post('/api/ping', (req, res) => {
+    // Create a simple fingerprint based on IP and User-Agent
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const ua = req.headers['user-agent'] || 'unknown';
+    const id = `${ip}|${ua}`;
+    
+    // Update last seen time
+    activeSessions.set(id, Date.now());
+    res.sendStatus(200);
+});
+
 // --- ADMIN ENDPOINTS (NEW) ---
 
 // 1. Check Login
@@ -149,17 +162,24 @@ app.post('/api/admin/flush-all', requireAdmin, async (req, res) => {
     }
 });
 
-// 4. Get Server Stats
+// 4. Get Server Stats (Updated with Real Online Users)
 app.get('/api/admin/stats', requireAdmin, async (req, res) => {
     const memKeys = Object.keys(db).length;
     let dbCount = 0;
     if (TokenModel) dbCount = await TokenModel.countDocuments();
     
+    // Prune stale sessions (older than 60 seconds)
+    const now = Date.now();
+    for (const [id, lastSeen] of activeSessions.entries()) {
+        if (now - lastSeen > 60000) activeSessions.delete(id);
+    }
+
     res.json({
         memory_keys: memKeys,
         mongo_docs: dbCount,
         queue_length: priorityQueue.length,
-        eco_list_size: ecoList.length
+        eco_list_size: ecoList.length,
+        online_users: activeSessions.size // Real real-time count
     });
 });
 

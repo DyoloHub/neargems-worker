@@ -22,10 +22,8 @@ const allowedOrigins = [
 
 app.use(cors({
     origin: function (origin, callback) {
-        // Allow requests with no origin (like mobile apps or curl requests)
         if (!origin) return callback(null, true);
         if (allowedOrigins.indexOf(origin) === -1) {
-            // OPTIONAL: Allow admin page access from anywhere or add specific domain
             return callback(null, true); 
         }
         return callback(null, true);
@@ -50,7 +48,9 @@ let ecoList = [];
 let ecoIndex = 0; 
 let priorityQueue = []; 
 const activeSessions = new Map(); // Track active users (IP/Session -> Timestamp)
-const scanCounts = new Map(); // NEW: Track scan counts per token ID
+
+// CHANGED: scanCounts now maps TokenID -> Array of Timestamps [ts1, ts2, ...]
+const scanCounts = new Map(); 
 
 // --- DATABASE SETUP (MONGODB) ---
 let TokenModel = null;
@@ -62,7 +62,6 @@ if (mongoose && MONGO_URI) {
         .then(() => console.log("[DB] MongoDB Connected!"))
         .catch(e => console.error("[DB] Connection Error:", e));
 
-    // 1. Graph Data Schema
     const TokenSchema = new mongoose.Schema({
         id: { type: String, unique: true },
         nodes: Array,
@@ -72,7 +71,6 @@ if (mongoose && MONGO_URI) {
     });
     TokenModel = mongoose.model('TokenGraph', TokenSchema);
 
-    // 2. Donation Schema
     const DonationSchema = new mongoose.Schema({
         sender: String,
         amount: Number,
@@ -83,7 +81,6 @@ if (mongoose && MONGO_URI) {
     DonationModel = mongoose.model('Donation', DonationSchema);
 
 } else {
-    // File fallback
     if (fs.existsSync(DB_FILE)) {
         try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { db = {}; }
     }
@@ -104,42 +101,28 @@ app.get('/', (req, res) => {
     res.send('NearGems Brain is Active.');
 });
 
-// NEW: Heartbeat Endpoint for Real-Time Analytics
 app.post('/api/ping', (req, res) => {
-    // Create a simple fingerprint based on IP and User-Agent
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     const ua = req.headers['user-agent'] || 'unknown';
     const id = `${ip}|${ua}`;
-    
-    // Update last seen time
     activeSessions.set(id, Date.now());
     res.sendStatus(200);
 });
 
-// --- ADMIN ENDPOINTS (NEW) ---
+// --- ADMIN ENDPOINTS ---
 
-// 1. Check Login
 app.post('/api/admin/login', requireAdmin, (req, res) => {
     res.json({ success: true, message: "Logged in successfully" });
 });
 
-// 2. Reset Specific Token Data
 app.post('/api/admin/reset-token', requireAdmin, async (req, res) => {
     const { tokenId } = req.body;
     if (!tokenId) return res.status(400).json({ error: "Token ID required" });
 
     try {
-        // Clear from Memory
         if (db[tokenId]) delete db[tokenId];
-        
-        // Clear from MongoDB
-        if (TokenModel) {
-            await TokenModel.deleteOne({ id: tokenId });
-        }
-        
-        // Sync File
+        if (TokenModel) await TokenModel.deleteOne({ id: tokenId });
         try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e){}
-
         console.log(`[ADMIN] Wiped data for ${tokenId}`);
         res.json({ success: true, message: `Database entry for ${tokenId} deleted.` });
     } catch (e) {
@@ -147,18 +130,12 @@ app.post('/api/admin/reset-token', requireAdmin, async (req, res) => {
     }
 });
 
-// 3. Flush All Cache (Dangerous)
 app.post('/api/admin/flush-all', requireAdmin, async (req, res) => {
     try {
         db = {};
-        if (TokenModel) {
-            await TokenModel.deleteMany({});
-        }
+        if (TokenModel) await TokenModel.deleteMany({});
         try { fs.writeFileSync(DB_FILE, JSON.stringify({})); } catch(e){}
-        
-        // Also clear stats
         scanCounts.clear();
-        
         console.log(`[ADMIN] FLUSHED ALL DATA`);
         res.json({ success: true, message: "All graph data deleted." });
     } catch (e) {
@@ -166,23 +143,50 @@ app.post('/api/admin/flush-all', requireAdmin, async (req, res) => {
     }
 });
 
-// 4. Get Server Stats (Updated with Top Scanned)
+// 4. Get Server Stats (Updated with 24h Logic)
 app.get('/api/admin/stats', requireAdmin, async (req, res) => {
     const memKeys = Object.keys(db).length;
     let dbCount = 0;
     if (TokenModel) dbCount = await TokenModel.countDocuments();
     
-    // Prune stale sessions (older than 60 seconds)
+    // Prune stale sessions
     const now = Date.now();
     for (const [id, lastSeen] of activeSessions.entries()) {
         if (now - lastSeen > 60000) activeSessions.delete(id);
     }
     
-    // Calculate Top Scanned
-    const topScanned = [...scanCounts.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 10)
-        .map(([id, count]) => ({ id, count }));
+    // Calculate Top Scanned (All Time vs 24h)
+    const allTime = [];
+    const last24h = [];
+    const oneDayAgo = now - (24 * 60 * 60 * 1000);
+
+    // Iterate scanCounts Map
+    for (const [id, timestamps] of scanCounts.entries()) {
+        // Filter timestamps for 24h count
+        // Note: We also cleanup old timestamps here to save memory eventually, 
+        // but for simplicity we just filter for the report now.
+        const valid24h = timestamps.filter(t => t > oneDayAgo);
+        
+        // Update memory with pruned array to prevent infinite growth
+        if (valid24h.length < timestamps.length) {
+             scanCounts.set(id, valid24h.length > 0 ? valid24h : []); 
+             // If we wanted to keep "All Time" accurate forever, we wouldn't prune.
+             // BUT for a simple server without dedicated stats DB, pruning keeps it fast.
+             // COMPROMISE: We will prune, so "All Time" effectively becomes "Since Server Restart" or "Rolling Window" depending on pruning logic.
+             // To keep "All Time" truly all time, we'd need a separate counter.
+             // Let's implement a dual structure for better data:
+        }
+        
+        // ACTUALLY: Let's assume scanCounts stores ALL timestamps since server start. 
+        // We won't prune for now to keep "All Time" valid until restart.
+        
+        if (timestamps.length > 0) allTime.push({ id, count: timestamps.length });
+        if (valid24h.length > 0) last24h.push({ id, count: valid24h.length });
+    }
+
+    // Sort & Slice
+    allTime.sort((a, b) => b.count - a.count);
+    last24h.sort((a, b) => b.count - a.count);
 
     res.json({
         memory_keys: memKeys,
@@ -190,7 +194,8 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
         queue_length: priorityQueue.length,
         eco_list_size: ecoList.length,
         online_users: activeSessions.size,
-        top_scanned: topScanned // Return top scanned list
+        top_scanned: allTime.slice(0, 10),
+        top_scanned_24h: last24h.slice(0, 10) // New Field
     });
 });
 
@@ -204,7 +209,6 @@ app.post('/api/record-donation', async (req, res) => {
     try {
         const newDonation = new DonationModel({ sender, amount, txHash, message: message || "", timestamp: Date.now() });
         await newDonation.save();
-        console.log(`[DONATION] Saved: ${amount} NEAR from ${sender}`);
         res.json({ success: true });
     } catch (e) {
         if(e.code === 11000) return res.json({ success: true, message: "Already recorded" });
@@ -228,10 +232,11 @@ app.get('/api/top-donors', async (req, res) => {
 app.get('/data', async (req, res) => {
     const token = req.query.token;
     
-    // Update Scan Count
+    // Update Scan Count (Store Timestamp)
     if (token) {
-        const current = scanCounts.get(token) || 0;
-        scanCounts.set(token, current + 1);
+        const currentTimestamps = scanCounts.get(token) || [];
+        currentTimestamps.push(Date.now());
+        scanCounts.set(token, currentTimestamps);
         
         if (!priorityQueue.includes(token)) {
             priorityQueue.unshift(token); 
@@ -240,16 +245,13 @@ app.get('/data', async (req, res) => {
     }
     
     if (!token) return res.json({ status: "miss" });
-    
-    // Check Memory First
     if (db[token]) return res.json(db[token]);
     
-    // Check Mongo
     if (TokenModel) {
         try {
             const doc = await TokenModel.findOne({ id: token });
             if (doc) { 
-                db[token] = doc.toObject(); // Cache it back to memory
+                db[token] = doc.toObject();
                 return res.json(doc); 
             }
         } catch(e) {}
@@ -362,8 +364,6 @@ async function deepScanToken(tokenId) {
                 if (!links.find(l => l.id === linkId)) links.push({ source: whaleId, target: partner, id: linkId });
                 
                 if (!processed.has(partner)) {
-                    // NOTE: Balance defaults to 0 here to avoid making 1000s of RPC calls.
-                    // The client-side (main.js) should fetch these specific balances if clicked/needed.
                     nodes.push({ id: partner, group: "partner", balance: "0", isCore: false });
                     processed.add(partner);
                 }

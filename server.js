@@ -50,11 +50,12 @@ let priorityQueue = [];
 const activeSessions = new Map(); // Track active users (IP/Session -> Timestamp)
 
 // CHANGED: scanCounts now maps TokenID -> Array of Timestamps [ts1, ts2, ...]
-const scanCounts = new Map(); 
+let scanCounts = new Map(); 
 
 // --- DATABASE SETUP (MONGODB) ---
 let TokenModel = null;
 let DonationModel = null;
+let ActivityModel = null; // NEW: Activity Log
 
 if (mongoose && MONGO_URI) {
     console.log("[DB] Connecting to MongoDB...");
@@ -80,10 +81,40 @@ if (mongoose && MONGO_URI) {
     });
     DonationModel = mongoose.model('Donation', DonationSchema);
 
+    // NEW: Track User Behavior
+    const ActivitySchema = new mongoose.Schema({
+        type: String, // e.g., 'MODE_SWITCH', 'DEEP_SCAN', 'LINK_CLICK'
+        detail: String, // e.g., 'eco', 'token.near', 'pikespeak'
+        ip: String,
+        timestamp: Number
+    });
+    ActivityModel = mongoose.model('Activity', ActivitySchema);
+
 } else {
     if (fs.existsSync(DB_FILE)) {
-        try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { db = {}; }
+        try { 
+            const loaded = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+            db = loaded.db || {};
+            // Restore scan counts if available
+            if (loaded.scanCounts) {
+                scanCounts = new Map(JSON.parse(loaded.scanCounts));
+            } else {
+                // Legacy support
+                if (!loaded.db) db = loaded;
+            }
+        } catch (e) { db = {}; }
     }
+}
+
+// --- HELPER: SAVE DB ---
+function saveDatabase() {
+    try {
+        const dump = {
+            db: db,
+            scanCounts: JSON.stringify([...scanCounts]) // Serialize Map
+        };
+        fs.writeFileSync(DB_FILE, JSON.stringify(dump));
+    } catch(e) {}
 }
 
 // --- ADMIN MIDDLEWARE ---
@@ -109,6 +140,30 @@ app.post('/api/ping', (req, res) => {
     res.sendStatus(200);
 });
 
+// NEW: General Activity Tracking Endpoint
+app.post('/api/track', async (req, res) => {
+    const { type, detail } = req.body;
+    if (!type) return res.sendStatus(400);
+
+    // 1. Log to Console (Real-time logs)
+    console.log(`[ACT] ${type}: ${detail || ''}`);
+
+    // 2. Save to DB
+    if (ActivityModel) {
+        try {
+            const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+            const log = new ActivityModel({
+                type, 
+                detail: detail || "",
+                ip,
+                timestamp: Date.now()
+            });
+            log.save().catch(err => console.error("Log save failed", err));
+        } catch(e) {}
+    }
+    res.sendStatus(200);
+});
+
 // --- ADMIN ENDPOINTS ---
 
 app.post('/api/admin/login', requireAdmin, (req, res) => {
@@ -122,7 +177,7 @@ app.post('/api/admin/reset-token', requireAdmin, async (req, res) => {
     try {
         if (db[tokenId]) delete db[tokenId];
         if (TokenModel) await TokenModel.deleteOne({ id: tokenId });
-        try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e){}
+        saveDatabase();
         console.log(`[ADMIN] Wiped data for ${tokenId}`);
         res.json({ success: true, message: `Database entry for ${tokenId} deleted.` });
     } catch (e) {
@@ -134,8 +189,10 @@ app.post('/api/admin/flush-all', requireAdmin, async (req, res) => {
     try {
         db = {};
         if (TokenModel) await TokenModel.deleteMany({});
-        try { fs.writeFileSync(DB_FILE, JSON.stringify({})); } catch(e){}
+        saveDatabase();
         scanCounts.clear();
+        if (ActivityModel) await ActivityModel.deleteMany({}); // Optional: Flush logs too? Maybe keep them.
+        
         console.log(`[ADMIN] FLUSHED ALL DATA`);
         res.json({ success: true, message: "All graph data deleted." });
     } catch (e) {
@@ -143,7 +200,7 @@ app.post('/api/admin/flush-all', requireAdmin, async (req, res) => {
     }
 });
 
-// 4. Get Server Stats (Updated with 24h Logic)
+// 4. Get Server Stats (Updated with Activity Logs)
 app.get('/api/admin/stats', requireAdmin, async (req, res) => {
     const memKeys = Object.keys(db).length;
     let dbCount = 0;
@@ -160,33 +217,38 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
     const last24h = [];
     const oneDayAgo = now - (24 * 60 * 60 * 1000);
 
-    // Iterate scanCounts Map
     for (const [id, timestamps] of scanCounts.entries()) {
-        // Filter timestamps for 24h count
-        // Note: We also cleanup old timestamps here to save memory eventually, 
-        // but for simplicity we just filter for the report now.
         const valid24h = timestamps.filter(t => t > oneDayAgo);
         
-        // Update memory with pruned array to prevent infinite growth
-        if (valid24h.length < timestamps.length) {
-             scanCounts.set(id, valid24h.length > 0 ? valid24h : []); 
-             // If we wanted to keep "All Time" accurate forever, we wouldn't prune.
-             // BUT for a simple server without dedicated stats DB, pruning keeps it fast.
-             // COMPROMISE: We will prune, so "All Time" effectively becomes "Since Server Restart" or "Rolling Window" depending on pruning logic.
-             // To keep "All Time" truly all time, we'd need a separate counter.
-             // Let's implement a dual structure for better data:
+        // Simple pruning to keep memory low (Keep max 5000 timestamps per token)
+        if (timestamps.length > 5000) {
+             const pruned = timestamps.slice(-5000);
+             scanCounts.set(id, pruned);
         }
-        
-        // ACTUALLY: Let's assume scanCounts stores ALL timestamps since server start. 
-        // We won't prune for now to keep "All Time" valid until restart.
         
         if (timestamps.length > 0) allTime.push({ id, count: timestamps.length });
         if (valid24h.length > 0) last24h.push({ id, count: valid24h.length });
     }
 
-    // Sort & Slice
     allTime.sort((a, b) => b.count - a.count);
     last24h.sort((a, b) => b.count - a.count);
+
+    // FETCH ACTIVITY LOGS
+    let recentActivity = [];
+    let modeStats = { scan: 0, eco: 0 };
+    
+    if (ActivityModel) {
+        try {
+            recentActivity = await ActivityModel.find().sort({ timestamp: -1 }).limit(20);
+            
+            // Simple agg for mode stats (last 1000 events)
+            const recentModes = await ActivityModel.find({ type: 'MODE_SWITCH' }).limit(1000);
+            recentModes.forEach(m => {
+                if (m.detail === 'eco') modeStats.eco++;
+                if (m.detail === 'scan') modeStats.scan++;
+            });
+        } catch(e) {}
+    }
 
     res.json({
         memory_keys: memKeys,
@@ -195,7 +257,9 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
         eco_list_size: ecoList.length,
         online_users: activeSessions.size,
         top_scanned: allTime.slice(0, 10),
-        top_scanned_24h: last24h.slice(0, 10) // New Field
+        top_scanned_24h: last24h.slice(0, 10),
+        recent_activity: recentActivity,
+        mode_usage: modeStats
     });
 });
 
@@ -237,6 +301,7 @@ app.get('/data', async (req, res) => {
         const currentTimestamps = scanCounts.get(token) || [];
         currentTimestamps.push(Date.now());
         scanCounts.set(token, currentTimestamps);
+        saveDatabase(); // Save counts on change
         
         if (!priorityQueue.includes(token)) {
             priorityQueue.unshift(token); 
@@ -386,7 +451,7 @@ async function deepScanToken(tokenId) {
             await TokenModel.findOneAndUpdate({ id: tokenId }, finalData, { upsert: true, new: true });
         } catch(e) {}
     }
-    try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e) {}
+    saveDatabase(); // Persist changes
     console.log(`[DONE] ${tokenId}: ${nodes.length} nodes, ${links.length} links.`);
 }
 

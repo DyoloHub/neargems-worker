@@ -402,6 +402,23 @@ async function deepScanToken(tokenId) {
     if (!holdersData || !holdersData.accounts) return;
 
     const holders = holdersData.accounts.slice(0, 40);
+
+    // --- SAFETY CHECK (PREVENT BAD DB SAVES) ---
+    if (holders.length === 0) {
+        console.log(`[ABORT] ${tokenId}: Zero holders returned. Skipping save.`);
+        return;
+    }
+    
+    // Check for "Zero Balance" Syndrome
+    try {
+        const totalBal = holders.reduce((acc, h) => acc + BigInt(h.balance || 0), 0n);
+        if (totalBal === 0n) {
+            console.log(`[ABORT] ${tokenId}: Zero total balance (Indexer Lag). Skipping save to protect DB.`);
+            return;
+        }
+    } catch(e) { return; }
+    // -------------------------------------------
+
     let nodes = [];
     let links = [];
     let processed = new Set();

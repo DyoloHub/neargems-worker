@@ -9,8 +9,6 @@ try { mongoose = require('mongoose'); } catch (e) { console.log("[WARN] Mongoose
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI; 
-// SECURE ADMIN PASSWORD (Set this in Render Environment Variables)
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "change_this_default_password";
 
 // --- SECURITY: THE BOUNCER (CORS) ---
 const allowedOrigins = [
@@ -404,6 +402,7 @@ async function deepScanToken(tokenId) {
     const holders = holdersData.accounts.slice(0, 40);
 
     // --- SAFETY CHECK (PREVENT BAD DB SAVES) ---
+    // If the data returned is empty or looks malformed (zero total balance), abort the save.
     if (holders.length === 0) {
         console.log(`[ABORT] ${tokenId}: Zero holders returned. Skipping save.`);
         return;
